@@ -51,6 +51,18 @@ python trader.py --live    # 실제 주문
 
 `python` 이 없으면 `python3` 로 같은 명령을 실행하면 됩니다.
 
+Windows에서는 `C:\Users\ksw\trade` 처럼 프로젝트 폴더를 연 뒤, 가상환경을 먼저 만듭니다. `install` 만 치거나 `.venv` 를 만들기 전에 pip 경로를 실행하면 명령을 찾지 못합니다.
+
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+set UPBIT_ACCESS_KEY=발급받은액세스
+set UPBIT_SECRET_KEY=발급받은시크릿
+.venv\Scripts\python trader.py --live
+```
+
+`python` 이 없으면 첫 줄을 `py -3 -m venv .venv` 로 바꿉니다. 실주문은 이 PC의 공인 IP가 업비트 허용 목록에 있을 때만 됩니다.
+
 실거래는 `--live` 이거나 `UPBIT_DRY_RUN=0` 일 때만 나갑니다. 포지션은 `state/paper_KRW-ALL.json`, 시세 스냅샷은 `state/prices_paper_KRW-ALL.json` 에 저장됩니다.
 
 한 종목만 보려면 그 종목에 원화의 50%를 씁니다.
