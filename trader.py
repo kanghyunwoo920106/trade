@@ -4,9 +4,11 @@
 
 전략 (래리 윌리엄스 변동성 돌파를 업비트 일봉에 맞춘 형태)
 ----------------------------------------------------------------
-- 대상: KRW-BTC (환경 변수 UPBIT_TICKER 로 변경 가능)
-- 매수: 현재가가 당일 시가 + (전일 고가 - 전일 저가) * 0.5 를 돌파하면
-        보유 원화의 50% 로 시장가 매수. 거래일(09:00~다음날 09:00)당 1회.
+- 대상: 업비트 원화(KRW) 마켓 전체. ``--ticker KRW-BTC`` 로 한 종목만 볼 수 있다.
+- 매수: 현재가가 당일 시가 + (전일 고가 - 전일 저가) * 0.5 를 돌파하면 시장가 매수.
+        거래일(09:00~다음날 09:00)과 종목당 1회.
+        전체 마켓에서는 원화의 50%를 최대 10종목에 나눠 쓴다.
+        한 종목만 보면 그 종목에 원화의 50%를 쓴다.
 - 매도: 익절 +3%, 손절 -2%, 또는 다음 거래일 09:00(KST) 에 봇이 산 수량 전량 매도.
 - 기본 실행은 모의매매다. 실주문은 ``python trader.py --live`` 로만 나간다.
 
@@ -29,8 +31,10 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
-from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -56,10 +60,13 @@ SECRET_KEY = os.environ.get("UPBIT_SECRET_KEY", "").strip()
 FEE_RATE = Decimal("0.0005")
 
 # 시세 API 초당 10회, 주문 API 초당 8회 한도를 넘지 않도록 요청 사이에 둔다.
-REQUEST_INTERVAL_SEC = 0.2
+REQUEST_INTERVAL_SEC = 0.12
 
-# 일봉은 자주 변하지 않는다. 현재가만 매 루프 조회한다.
-OHLCV_CACHE_SEC = 30.0
+# 목표가에 쓰는 전일 고저가는 장중에는 바뀌지 않는다. 일봉은 10분마다 다시 받는다.
+OHLCV_CACHE_SEC = 600.0
+
+# 원화 마켓이 수백 개라 일봉은 여러 요청을 겹치되, 시작 간격은 위 한도를 지킨다.
+CANDLE_WORKERS = 4
 
 # 주문 실패 시 같은 조건을 매초 다시 치지 않도록 잠시 쉰다.
 ORDER_RETRY_SEC = 10.0
@@ -69,20 +76,24 @@ VOLUME_DECIMALS = 8
 
 @dataclass(frozen=True)
 class Config:
-    """전략 숫자와 실행 모드. 기본값은 요청 예시와 같다."""
+    """전략 숫자와 실행 모드.
 
-    ticker: str = "KRW-BTC"
+    ticker 가 None 이면 업비트 원화 마켓 전체다.
+    """
+
+    ticker: Optional[str] = None
     k: Decimal = Decimal("0.5")
     take_profit: Decimal = Decimal("0.03")
     stop_loss: Decimal = Decimal("0.02")
     invest_ratio: Decimal = Decimal("0.5")
+    max_positions: int = 10
     min_order_krw: int = 5000
     no_buy_minutes: int = 5
-    loop_seconds: float = 1.0
+    loop_seconds: float = 2.0
     paper_krw: int = 1_000_000
     live: bool = False
     once: bool = False
-    state_path: Path = Path("state/paper_KRW-BTC.json")
+    state_path: Path = Path("state/paper_KRW-ALL.json")
 
 
 @dataclass
@@ -96,11 +107,15 @@ class Position:
 
 @dataclass
 class BotState:
-    ticker: str
-    last_buy_day: Optional[str] = None
+    """여러 종목의 포지션을 한 계좌 잔고로 관리한다."""
+
+    positions: dict[str, Position] = field(default_factory=dict)
+    last_buy_days: dict[str, str] = field(default_factory=dict)
     paper_krw: Optional[int] = None
-    paper_volume: str = "0"
-    position: Optional[Position] = None
+    paper_volumes: dict[str, str] = field(default_factory=dict)
+
+    def open_position_count(self) -> int:
+        return sum(1 for position in self.positions.values() if Decimal(position.volume) > 0)
 
 
 @dataclass(frozen=True)
@@ -115,6 +130,7 @@ class Snapshot:
     candle_day: Optional[str]
     krw_balance: Decimal
     coin_volume: Decimal
+    ticker: str = "KRW-BTC"
 
 
 @dataclass(frozen=True)
@@ -231,8 +247,20 @@ def _sell_decision(
     )
 
 
+def position_slots(config: Config) -> int:
+    """한 종목 모드는 그 종목 하나에 투자 비율을 모두 쓴다."""
+    if config.ticker:
+        return 1
+    return config.max_positions
+
+
+def order_budget_ratio(config: Config) -> Decimal:
+    """종목 하나에 쓸 원화 비율. 전체 마켓에서는 50%를 슬롯 수로 나눈다."""
+    return config.invest_ratio / Decimal(position_slots(config))
+
+
 def evaluate(config: Config, snap: Snapshot, state: BotState) -> Decision:
-    """지금 사야 하는지, 팔아야 하는지, 기다려야 하는지 정한다."""
+    """한 종목을 두고 지금 살지, 팔지, 기다릴지 정한다."""
     day = trading_day_key(snap.now)
     target: Optional[Decimal] = None
     if (
@@ -244,7 +272,7 @@ def evaluate(config: Config, snap: Snapshot, state: BotState) -> Decision:
     ):
         target = calc_target_price(snap.today_open, snap.prev_high, snap.prev_low, config.k)
 
-    position = state.position
+    position = state.positions.get(snap.ticker)
     if position is not None and Decimal(position.volume) > 0:
         entry = Decimal(position.entry_price)
         pnl = price_change_rate(snap.price, entry) if entry > 0 else None
@@ -262,7 +290,7 @@ def evaluate(config: Config, snap: Snapshot, state: BotState) -> Decision:
             pnl_rate=pnl,
         )
 
-    if state.last_buy_day == day:
+    if state.last_buy_days.get(snap.ticker) == day:
         return Decision("hold", "오늘은 이미 매수해서 다시 사지 않습니다", target)
 
     if target is None:
@@ -275,7 +303,10 @@ def evaluate(config: Config, snap: Snapshot, state: BotState) -> Decision:
     if snap.price < target:
         return Decision("hold", "현재가가 목표가보다 낮습니다", target)
 
-    order_krw = calc_order_krw(snap.krw_balance, config.invest_ratio, config.min_order_krw)
+    if config.ticker is None and state.open_position_count() >= config.max_positions:
+        return Decision("hold", "최대 보유 종목 수에 도달해서 신규 매수하지 않습니다", target)
+
+    order_krw = calc_order_krw(snap.krw_balance, order_budget_ratio(config), config.min_order_krw)
     if order_krw is None:
         return Decision(
             "hold",
@@ -322,42 +353,51 @@ def log_balances(snap: Snapshot, ticker: str, now: datetime) -> None:
     )
 
 
-def load_state(path: Path, ticker: str, paper_krw: int) -> BotState:
+def load_state(path: Path, paper_krw: int) -> BotState:
     if not path.exists():
-        return BotState(ticker=ticker, paper_krw=paper_krw, paper_volume="0")
+        return BotState(paper_krw=paper_krw)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        position = None
-        if raw.get("position"):
-            position = Position(**raw["position"])
-        state = BotState(
-            ticker=raw.get("ticker", ticker),
-            last_buy_day=raw.get("last_buy_day"),
+        positions = {
+            ticker: Position(**payload)
+            for ticker, payload in (raw.get("positions") or {}).items()
+        }
+        # 예전 단일 종목 파일도 읽는다.
+        if not positions and raw.get("position") and raw.get("ticker"):
+            positions[str(raw["ticker"])] = Position(**raw["position"])
+        last_buy_days = {str(key): str(value) for key, value in (raw.get("last_buy_days") or {}).items()}
+        if not last_buy_days and raw.get("last_buy_day") and raw.get("ticker"):
+            last_buy_days[str(raw["ticker"])] = str(raw["last_buy_day"])
+        paper_volumes = {str(key): str(value) for key, value in (raw.get("paper_volumes") or {}).items()}
+        if not paper_volumes and raw.get("paper_volume") not in (None, "0") and raw.get("ticker"):
+            paper_volumes[str(raw["ticker"])] = str(raw["paper_volume"])
+        return BotState(
+            positions=positions,
+            last_buy_days=last_buy_days,
             paper_krw=raw.get("paper_krw", paper_krw),
-            paper_volume=str(raw.get("paper_volume", "0")),
-            position=position,
+            paper_volumes=paper_volumes,
         )
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         log(f"상태 파일을 읽지 못해 새로 시작합니다: {exc}")
-        return BotState(ticker=ticker, paper_krw=paper_krw, paper_volume="0")
-    if state.ticker != ticker:
-        log(f"상태 파일의 종목({state.ticker})이 현재 종목과 달라 포지션을 무시합니다.")
-        return BotState(ticker=ticker, paper_krw=paper_krw, paper_volume="0")
-    return state
+        return BotState(paper_krw=paper_krw)
 
 
 def save_state(path: Path, state: BotState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "ticker": state.ticker,
-        "last_buy_day": state.last_buy_day,
+        "last_buy_days": state.last_buy_days,
         "paper_krw": state.paper_krw,
-        "paper_volume": state.paper_volume,
-        "position": None if state.position is None else asdict(state.position),
+        "paper_volumes": state.paper_volumes,
+        "positions": {ticker: asdict(position) for ticker, position in state.positions.items()},
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def quote_path_for(state_path: Path) -> Path:
+    """포지션 파일과 겹치지 않게 시세 스냅샷 경로를 만든다."""
+    return state_path.with_name(f"prices_{state_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -369,23 +409,30 @@ class MarketDataError(RuntimeError):
 
 
 class MarketData:
-    """일봉은 짧게 캐시하고, 호출 뒤에는 항상 쉬어 요청 한도를 지킨다."""
+    """일봉은 종목별로 캐시하고, 호출 뒤에는 항상 쉬어 요청 한도를 지킨다."""
 
     def __init__(self, sleep: Callable[[float], None] = time.sleep) -> None:
         self._sleep = sleep
-        self._ohlcv_frame = None
-        self._ohlcv_at = 0.0
+        self._candles: dict[str, tuple[float, object]] = {}
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def krw_tickers(self) -> list[str]:
+        tickers = pyupbit.get_tickers(fiat="KRW")
+        self._sleep(REQUEST_INTERVAL_SEC)
+        if not tickers:
+            raise MarketDataError("원화 마켓 목록을 가져오지 못했습니다.")
+        return sorted(ticker for ticker in tickers if isinstance(ticker, str) and ticker.startswith("KRW-"))
 
     def daily_candles(self, ticker: str):
-        elapsed = time.monotonic() - self._ohlcv_at
-        if self._ohlcv_frame is not None and elapsed < OHLCV_CACHE_SEC:
-            return self._ohlcv_frame
+        cached = self._candles.get(ticker)
+        if cached is not None and time.monotonic() - cached[0] < OHLCV_CACHE_SEC:
+            return cached[1]
         frame = pyupbit.get_ohlcv(ticker, interval="day", count=2)
         self._sleep(REQUEST_INTERVAL_SEC)
         if frame is None or len(frame) < 2:
-            raise MarketDataError("일봉 조회에 실패했거나 캔들이 2개보다 적습니다.")
-        self._ohlcv_frame = frame
-        self._ohlcv_at = time.monotonic()
+            raise MarketDataError(f"{ticker} 일봉 조회에 실패했거나 캔들이 2개보다 적습니다.")
+        self._candles[ticker] = (time.monotonic(), frame)
         return frame
 
     def current_price(self, ticker: str) -> Decimal:
@@ -395,6 +442,86 @@ class MarketData:
             raise MarketDataError(f"현재가 조회에 실패했습니다: {price!r}")
         return Decimal(str(price))
 
+    def current_prices(self, tickers: list[str]) -> dict[str, Decimal]:
+        """현재가는 한 요청에 여러 종목을 실어 원화 마켓 전체를 빨리 본다."""
+        if len(tickers) == 1:
+            return {tickers[0]: self.current_price(tickers[0])}
+        found: dict[str, Decimal] = {}
+        for start in range(0, len(tickers), 100):
+            chunk = tickers[start:start + 100]
+            raw = pyupbit.get_current_price(chunk if len(chunk) > 1 else chunk[0])
+            self._sleep(REQUEST_INTERVAL_SEC)
+            if isinstance(raw, dict):
+                for market, price in raw.items():
+                    if isinstance(price, (int, float)):
+                        found[str(market)] = Decimal(str(price))
+            elif len(chunk) == 1 and isinstance(raw, (int, float)):
+                found[chunk[0]] = Decimal(str(raw))
+        return found
+
+    def load_levels(self, tickers: list[str], progress: Optional[Callable[[int, int, str], None]] = None) -> dict[str, "CandleLevels"]:
+        """전일 고저가와 당일 시가. 없는 종목만 다시 받고, 실패한 종목은 건너뛴다."""
+        missing = [ticker for ticker in tickers if not self._has_fresh_candles(ticker)]
+        if len(missing) > 1:
+            self._fetch_many(missing, progress)
+        elif len(missing) == 1:
+            ticker = missing[0]
+            try:
+                self.daily_candles(ticker)
+            except MarketDataError as exc:
+                log(str(exc))
+            if progress is not None:
+                progress(1, 1, ticker)
+        levels: dict[str, CandleLevels] = {}
+        for ticker in tickers:
+            cached = self._candles.get(ticker)
+            if cached is None:
+                continue
+            try:
+                levels[ticker] = levels_from_frame(cached[1])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return levels
+
+    def _has_fresh_candles(self, ticker: str) -> bool:
+        cached = self._candles.get(ticker)
+        return cached is not None and time.monotonic() - cached[0] < OHLCV_CACHE_SEC
+
+    def _reserve_request_slot(self) -> float:
+        with self._lock:
+            now = time.monotonic()
+            scheduled = max(now, self._next_request_at)
+            self._next_request_at = scheduled + REQUEST_INTERVAL_SEC
+            return scheduled - now
+
+    def _fetch_many(self, tickers: list[str], progress: Optional[Callable[[int, int, str], None]]) -> None:
+        total = len(tickers)
+
+        def fetch_one(ticker: str):
+            delay = self._reserve_request_slot()
+            if delay > 0:
+                self._sleep(delay)
+            frame = pyupbit.get_ohlcv(ticker, interval="day", count=2)
+            return ticker, frame
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=CANDLE_WORKERS) as pool:
+            futures = [pool.submit(fetch_one, ticker) for ticker in tickers]
+            for future in as_completed(futures):
+                done += 1
+                try:
+                    ticker, frame = future.result()
+                except Exception as exc:
+                    log(f"일봉 조회 오류: {type(exc).__name__}: {exc}")
+                    continue
+                if progress is not None and (done == 1 or done == total or done % 20 == 0):
+                    progress(done, total, ticker)
+                if frame is None or len(frame) < 2:
+                    log(f"일봉 건너뜀 | {ticker}")
+                    continue
+                with self._lock:
+                    self._candles[ticker] = (time.monotonic(), frame)
+
 
 def _candle_day(index_value) -> str:
     """pyupbit 일봉 인덱스는 KST 09:00 의 naive 시각이다. 날짜가 거래일 키와 같다."""
@@ -403,18 +530,37 @@ def _candle_day(index_value) -> str:
     return index_value.strftime("%Y-%m-%d")
 
 
-def snapshot_from_candles(frame, price: Decimal, krw: Decimal, coin: Decimal, now: datetime) -> Snapshot:
+@dataclass(frozen=True)
+class CandleLevels:
+    today_open: Decimal
+    prev_high: Decimal
+    prev_low: Decimal
+    candle_day: str
+
+
+def levels_from_frame(frame) -> CandleLevels:
     prev = frame.iloc[-2]
     today = frame.iloc[-1]
-    return Snapshot(
-        now=now,
-        price=price,
+    return CandleLevels(
         today_open=Decimal(str(today["open"])),
         prev_high=Decimal(str(prev["high"])),
         prev_low=Decimal(str(prev["low"])),
         candle_day=_candle_day(frame.index[-1]),
+    )
+
+
+def snapshot_from_candles(frame, price: Decimal, krw: Decimal, coin: Decimal, now: datetime, ticker: str = "KRW-BTC") -> Snapshot:
+    levels = levels_from_frame(frame)
+    return Snapshot(
+        now=now,
+        price=price,
+        today_open=levels.today_open,
+        prev_high=levels.prev_high,
+        prev_low=levels.prev_low,
+        candle_day=levels.candle_day,
         krw_balance=krw,
         coin_volume=coin,
+        ticker=ticker,
     )
 
 
@@ -441,6 +587,44 @@ def describe_order(result: object) -> str:
     return ", ".join(parts)
 
 
+def build_snapshots(
+    market: MarketData,
+    tickers: list[str],
+    now: datetime,
+    krw: Decimal,
+    volumes: dict[str, str],
+) -> list[Snapshot]:
+    """현재가와 일봉으로 종목별 판단 재료를 만든다. 실패한 종목은 건너뛴다."""
+    prices = market.current_prices(tickers)
+
+    def progress(done: int, total: int, ticker: str) -> None:
+        log(f"일봉 수집 {done}/{total} | {ticker}", now)
+
+    levels = market.load_levels(tickers, progress=progress)
+    snapshots: list[Snapshot] = []
+    for ticker in tickers:
+        price = prices.get(ticker)
+        level = levels.get(ticker)
+        if price is None or level is None:
+            continue
+        snapshots.append(
+            Snapshot(
+                now=now,
+                price=price,
+                today_open=level.today_open,
+                prev_high=level.prev_high,
+                prev_low=level.prev_low,
+                candle_day=level.candle_day,
+                krw_balance=krw,
+                coin_volume=Decimal(volumes.get(ticker, "0")),
+                ticker=ticker,
+            )
+        )
+    if tickers and not snapshots:
+        raise MarketDataError("시세를 가져오지 못했습니다.")
+    return snapshots
+
+
 class PaperExchange:
     """공개 시세만 조회하고 주문은 가상 잔고에 반영한다."""
 
@@ -450,48 +634,51 @@ class PaperExchange:
         if state.paper_krw is None:
             state.paper_krw = initial_krw
 
-    def fetch(self, ticker: str, now: datetime) -> Snapshot:
-        frame = self.market.daily_candles(ticker)
-        price = self.market.current_price(ticker)
-        return snapshot_from_candles(
-            frame,
-            price,
-            Decimal(state_krw(self.state)),
-            Decimal(self.state.paper_volume),
-            now,
-        )
+    def fetch_market(self, config: Config, now: datetime) -> list[Snapshot]:
+        return build_snapshots(self.market, self._tickers(config), now, Decimal(state_krw(self.state)), self.state.paper_volumes)
+
+    def _tickers(self, config: Config) -> list[str]:
+        if config.ticker:
+            return [config.ticker]
+        return self.market.krw_tickers()
+
+    def available_krw(self) -> Decimal:
+        return Decimal(state_krw(self.state))
 
     def buy(self, ticker: str, order_krw: int, price: Decimal) -> Fill:
-        del ticker  # 모의 체결은 종목명 없이 가격만 사용한다.
         krw = state_krw(self.state)
         if order_krw > krw:
-            return Fill(False, f"모의 매수 실패 | 주문 금액 {order_krw:,}원이 잔고 {krw:,}원보다 큽니다")
+            return Fill(False, f"모의 매수 실패 | {ticker} | 주문 금액 {order_krw:,}원이 잔고 {krw:,}원보다 큽니다")
         net = Decimal(order_krw) * (Decimal("1") - FEE_RATE)
         volume = floor_volume(net / price)
         if volume <= 0:
-            return Fill(False, "모의 매수 실패 | 주문 금액으로 살 수 있는 수량이 최소 단위보다 작습니다")
+            return Fill(False, f"모의 매수 실패 | {ticker} | 주문 금액으로 살 수 있는 수량이 최소 단위보다 작습니다")
+        held = Decimal(self.state.paper_volumes.get(ticker, "0"))
         self.state.paper_krw = krw - order_krw
-        self.state.paper_volume = volume_to_str(volume)
+        self.state.paper_volumes[ticker] = volume_to_str(held + volume)
         return Fill(
             True,
-            f"모의 매수 성공 | 주문 {order_krw:,} KRW | 체결가 {format_price(price)} | 수량 {volume_to_str(volume)}",
+            f"모의 매수 성공 | {ticker} | 주문 {order_krw:,} KRW | 체결가 {format_price(price)} | 수량 {volume_to_str(volume)}",
             entry_price=price,
             volume=volume,
         )
 
     def sell(self, ticker: str, volume: Decimal, price: Decimal) -> Fill:
-        del ticker
-        held = Decimal(self.state.paper_volume)
+        held = Decimal(self.state.paper_volumes.get(ticker, "0"))
         sell_volume = floor_volume(min(volume, held))
         if sell_volume <= 0:
-            return Fill(False, "모의 매도 실패 | 매도할 수량이 없습니다")
+            return Fill(False, f"모의 매도 실패 | {ticker} | 매도할 수량이 없습니다")
         gross = sell_volume * price
         proceeds = int((gross * (Decimal("1") - FEE_RATE)).to_integral_value(rounding=ROUND_DOWN))
         self.state.paper_krw = state_krw(self.state) + proceeds
-        self.state.paper_volume = "0"
+        remaining = floor_volume(held - sell_volume)
+        if remaining <= 0:
+            self.state.paper_volumes.pop(ticker, None)
+        else:
+            self.state.paper_volumes[ticker] = volume_to_str(remaining)
         return Fill(
             True,
-            f"모의 매도 성공 | 수량 {volume_to_str(sell_volume)} | 체결가 {format_price(price)} | 정산 {proceeds:,} KRW",
+            f"모의 매도 성공 | {ticker} | 수량 {volume_to_str(sell_volume)} | 체결가 {format_price(price)} | 정산 {proceeds:,} KRW",
             entry_price=price,
             volume=sell_volume,
         )
@@ -509,12 +696,34 @@ class LiveExchange:
         self.market = market
         self._sleep = sleep
 
-    def fetch(self, ticker: str, now: datetime) -> Snapshot:
-        frame = self.market.daily_candles(ticker)
-        price = self.market.current_price(ticker)
-        krw = self._balance("KRW")
-        coin = self._balance(ticker)
-        return snapshot_from_candles(frame, price, krw, coin, now)
+    def fetch_market(self, config: Config, now: datetime) -> list[Snapshot]:
+        tickers = [config.ticker] if config.ticker else self.market.krw_tickers()
+        krw, coins = self._accounts()
+        volumes = {ticker: coins.get(ticker, Decimal("0")) for ticker in tickers}
+        # 문자열로 넘기면 build_snapshots 가 Decimal 로 다시 읽는다.
+        text_volumes = {ticker: format(volume, "f") for ticker, volume in volumes.items()}
+        return build_snapshots(self.market, tickers, now, krw, text_volumes)
+
+    def available_krw(self) -> Decimal:
+        return self._balance("KRW")
+
+    def _accounts(self) -> tuple[Decimal, dict[str, Decimal]]:
+        """전체 잔고를 한 번만 조회한다. 종목마다 잔고 API 를 치지 않는다."""
+        rows = self.upbit.get_balances()
+        self._sleep(REQUEST_INTERVAL_SEC)
+        if not isinstance(rows, list):
+            raise MarketDataError("잔고 조회에 실패했습니다.")
+        krw = Decimal("0")
+        coins: dict[str, Decimal] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            currency = str(row.get("currency") or "")
+            if currency == "KRW" and row.get("unit_currency") in (None, "KRW"):
+                krw = Decimal(str(row.get("balance") or "0"))
+            elif row.get("unit_currency") == "KRW" and currency:
+                coins[f"KRW-{currency}"] = Decimal(str(row.get("balance") or "0"))
+        return krw, coins
 
     def _balance(self, ticker: str) -> Decimal:
         # get_balance 는 실패 시 None, 보유하지 않으면 0 을 반환한다.
@@ -593,69 +802,129 @@ class LiveExchange:
 # 1회 판단
 # ---------------------------------------------------------------------------
 
-def apply_fill(state: BotState, decision: Decision, fill: Fill, day: str) -> None:
+def apply_fill(state: BotState, ticker: str, decision: Decision, fill: Fill, day: str) -> None:
     if decision.action == "buy" and fill.success and fill.entry_price is not None and fill.volume is not None:
-        state.position = Position(
+        state.positions[ticker] = Position(
             trading_day=day,
             entry_price=format(fill.entry_price, "f"),
             volume=volume_to_str(fill.volume),
         )
-        state.last_buy_day = day
+        state.last_buy_days[ticker] = day
         return
-    if decision.action == "sell" and fill.success and state.position is not None:
-        sold = fill.volume if fill.volume is not None else Decimal(state.position.volume)
-        remaining = floor_volume(Decimal(state.position.volume) - sold)
+    position = state.positions.get(ticker)
+    if decision.action == "sell" and fill.success and position is not None:
+        sold = fill.volume if fill.volume is not None else Decimal(position.volume)
+        remaining = floor_volume(Decimal(position.volume) - sold)
         # 부분 체결이면 남은 수량만 다음 루프에서 다시 판다.
-        state.position = None if remaining <= 0 else Position(
-            trading_day=state.position.trading_day,
-            entry_price=state.position.entry_price,
-            volume=volume_to_str(remaining),
-        )
+        if remaining <= 0:
+            state.positions.pop(ticker, None)
+        else:
+            state.positions[ticker] = Position(
+                trading_day=position.trading_day,
+                entry_price=position.entry_price,
+                volume=volume_to_str(remaining),
+            )
 
 
 def run_once(config: Config, exchange, state: BotState, now: datetime, log_status: bool) -> str:
-    """시세를 보고 필요하면 주문한다.
+    """원화 마켓 시세를 보고 매도 후 돌파 종목을 매수한다.
 
     반환값은 ``hold``, ``filled``, ``rejected`` 중 하나다.
     조회 실패는 호출한 쪽으로 올려 보내고, 그 쪽에서 프로그램을 유지한다.
     """
-    snap = exchange.fetch(config.ticker, now)
-    decision = evaluate(config, snap, state)
+    snapshots = exchange.fetch_market(config, now)
     day = trading_day_key(now)
+    paired = [(snap, evaluate(config, snap, state)) for snap in snapshots]
+    if log_status or config.once:
+        _log_scan(paired, state, now)
+        _save_quotes(config.state_path, paired)
 
-    if decision.action == "hold":
-        if log_status:
-            _log_status(config, snap, decision, now)
-        return "hold"
+    filled = 0
+    rejected = 0
+    for snap, decision in paired:
+        if decision.action != "sell":
+            continue
+        outcome = _execute(config, exchange, state, snap, decision, day, now)
+        filled += outcome == "filled"
+        rejected += outcome == "rejected"
 
-    log_balances(snap, config.ticker, now)
+    # 돌파 폭이 큰 종목부터 산다. 매도 뒤 잔고와 보유 종목 수로 다시 판단한다.
+    candidates = []
+    for snap, decision in paired:
+        if decision.target_price is None or decision.target_price <= 0 or snap.price < decision.target_price:
+            continue
+        if snap.ticker in state.positions or state.last_buy_days.get(snap.ticker) == day:
+            continue
+        candidates.append((snap.price / decision.target_price, snap))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    for _strength, snap in candidates:
+        krw = _available_krw(exchange, state)
+        refreshed = _with_balance(snap, krw, Decimal(state.paper_volumes.get(snap.ticker, "0")))
+        decision = evaluate(config, refreshed, state)
+        if decision.action != "buy":
+            continue
+        outcome = _execute(config, exchange, state, refreshed, decision, day, now)
+        filled += outcome == "filled"
+        rejected += outcome == "rejected"
+
+    if filled:
+        return "filled"
+    if rejected:
+        return "rejected"
+    return "hold"
+
+
+def _available_krw(exchange, state: BotState) -> Decimal:
+    available = getattr(exchange, "available_krw", None)
+    if callable(available):
+        return Decimal(available())
+    return Decimal(state_krw(state))
+
+
+def _with_balance(snap: Snapshot, krw: Decimal, coin: Decimal) -> Snapshot:
+    return Snapshot(
+        now=snap.now,
+        price=snap.price,
+        today_open=snap.today_open,
+        prev_high=snap.prev_high,
+        prev_low=snap.prev_low,
+        candle_day=snap.candle_day,
+        krw_balance=krw,
+        coin_volume=coin,
+        ticker=snap.ticker,
+    )
+
+
+def _execute(config: Config, exchange, state: BotState, snap: Snapshot, decision: Decision, day: str, now: datetime) -> str:
+    log_balances(snap, snap.ticker, now)
     target_text = format_price(decision.target_price) if decision.target_price is not None else "-"
     if decision.action == "buy":
         log(
-            f"매수 시도 | {decision.reason} | 현재가 {format_price(snap.price)} | "
+            f"매수 시도 | {snap.ticker} | {decision.reason} | 현재가 {format_price(snap.price)} | "
             f"목표가 {target_text} | 주문금액 {decision.order_krw:,} KRW",
             now,
         )
-        fill = exchange.buy(config.ticker, int(decision.order_krw or 0), snap.price)
+        fill = exchange.buy(snap.ticker, int(decision.order_krw or 0), snap.price)
     else:
         pnl = _format_rate(decision.pnl_rate) if decision.pnl_rate is not None else "-"
         # 계좌에 실제로 있는 수량만 판다. 봇이 사지 않은 코인은 여기 포함되지 않는다.
         volume = floor_volume(min(decision.sell_volume or Decimal("0"), snap.coin_volume))
         if volume <= 0:
-            log("매도할 잔고가 없어 포지션 기록을 정리합니다.", now)
-            state.position = None
+            log(f"매도할 잔고가 없어 포지션 기록을 정리합니다 | {snap.ticker}", now)
+            state.positions.pop(snap.ticker, None)
             save_state(config.state_path, state)
             return "filled"
         log(
-            f"매도 시도 | {decision.reason} | 현재가 {format_price(snap.price)} | "
+            f"매도 시도 | {snap.ticker} | {decision.reason} | 현재가 {format_price(snap.price)} | "
             f"수익률 {pnl} | 수량 {volume_to_str(volume)}",
             now,
         )
-        fill = exchange.sell(config.ticker, volume, snap.price)
+        fill = exchange.sell(snap.ticker, volume, snap.price)
 
     if fill.success:
         log(f"주문 성공 | {fill.message}", now)
-        apply_fill(state, decision, fill, day)
+        apply_fill(state, snap.ticker, decision, fill, day)
         outcome = "filled"
     else:
         log(f"주문 실패 | {fill.message}", now)
@@ -664,17 +933,57 @@ def run_once(config: Config, exchange, state: BotState, now: datetime, log_statu
     return outcome
 
 
-def _log_status(config: Config, snap: Snapshot, decision: Decision, now: datetime) -> None:
-    target = format_price(decision.target_price) if decision.target_price is not None else "-"
-    coin = config.ticker.split("-", 1)[1]
-    extra = ""
-    if decision.pnl_rate is not None:
-        extra = f" | 평가손익 {_format_rate(decision.pnl_rate)}"
+def _log_scan(paired: list[tuple[Snapshot, Decision]], state: BotState, now: datetime) -> None:
+    breakouts = []
+    for snap, decision in paired:
+        if decision.target_price is None or decision.target_price <= 0 or snap.price < decision.target_price:
+            continue
+        if snap.ticker in state.positions:
+            continue
+        breakouts.append((snap.price / decision.target_price, snap, decision))
+    breakouts.sort(key=lambda item: item[0], reverse=True)
+    krw = paired[0][0].krw_balance if paired else Decimal("0")
     log(
-        f"상태 | {decision.reason} | 현재가 {format_price(snap.price)} | 목표가 {target} | "
-        f"원화 {format_krw(snap.krw_balance)} | {coin} {volume_to_str(snap.coin_volume)}{extra}",
+        f"시세 포착 | 조회 {len(paired)}개 | 돌파 {len(breakouts)}개 | "
+        f"보유 {state.open_position_count()}개 | 원화 {format_krw(krw)}",
         now,
     )
+    for _strength, snap, decision in breakouts[:8]:
+        assert decision.target_price is not None
+        log(
+            f"돌파 | {snap.ticker} | 현재가 {format_price(snap.price)} | "
+            f"목표가 {format_price(decision.target_price)} | 초과 {_format_rate(snap.price / decision.target_price - 1)}",
+            now,
+        )
+    by_ticker = {snap.ticker: snap for snap, _decision in paired}
+    for ticker, position in state.positions.items():
+        snap = by_ticker.get(ticker)
+        if snap is None or Decimal(position.entry_price) <= 0:
+            log(f"보유 | {ticker} | 수량 {position.volume}", now)
+            continue
+        pnl = price_change_rate(snap.price, Decimal(position.entry_price))
+        log(
+            f"보유 | {ticker} | 현재가 {format_price(snap.price)} | 평단 {position.entry_price} | "
+            f"평가손익 {_format_rate(pnl)} | 수량 {position.volume}",
+            now,
+        )
+
+
+def _save_quotes(state_path: Path, paired: list[tuple[Snapshot, Decision]]) -> None:
+    rows = []
+    for snap, decision in paired:
+        rows.append(
+            {
+                "ticker": snap.ticker,
+                "price": format(snap.price, "f"),
+                "target": None if decision.target_price is None else format(decision.target_price, "f"),
+                "action": decision.action,
+            }
+        )
+    rows.sort(key=lambda row: row["ticker"])
+    path = quote_path_for(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def build_exchange(config: Config, state: BotState, market: Optional[MarketData] = None):
@@ -695,7 +1004,7 @@ def run(
     now_fn: Callable[[], datetime] = lambda: datetime.now(KST),
     exchange_builder: Optional[Callable[[BotState], object]] = None,
 ) -> int:
-    state = load_state(config.state_path, config.ticker, config.paper_krw)
+    state = load_state(config.state_path, config.paper_krw)
     _print_banner(config)
     exchange = build_exchange(config, state) if exchange_builder is None else exchange_builder(state)
     last_status = 0.0
@@ -736,10 +1045,13 @@ def _print_banner(config: Config) -> None:
     print("=" * 62, flush=True)
     print("업비트 변동성 돌파 자동매매", flush=True)
     print(f"모드     : {mode}", flush=True)
-    print(f"종목     : {config.ticker}", flush=True)
+    universe = config.ticker or "원화 마켓 전체"
+    per_order = order_budget_ratio(config) * Decimal("100")
+    print(f"종목     : {universe}", flush=True)
     print(
         f"매개변수 : K={config.k} | 익절={_format_rate(config.take_profit)} | "
-        f"손절=-{config.stop_loss * Decimal('100'):.2f}% | 투자비율={config.invest_ratio * Decimal('100'):.0f}%",
+        f"손절=-{config.stop_loss * Decimal('100'):.2f}% | "
+        f"종목당 {per_order:.2f}% | 최대 {position_slots(config)}종목",
         flush=True,
     )
     print(f"상태파일 : {config.state_path}", flush=True)
@@ -775,7 +1087,11 @@ def parse_args(argv: Optional[list[str]] = None) -> Config:
     parser.add_argument("--live", action="store_true", help="실제 주문을 전송한다")
     parser.add_argument("--paper", action="store_true", help="모의매매로 강제한다")
     parser.add_argument("--once", action="store_true", help="한 번만 판단하고 종료한다")
-    parser.add_argument("--ticker", default=os.environ.get("UPBIT_TICKER", "KRW-BTC"))
+    parser.add_argument(
+        "--ticker",
+        default=os.environ.get("UPBIT_TICKER", "ALL"),
+        help="ALL 이면 원화 마켓 전체, KRW-BTC 처럼 주면 그 종목만",
+    )
     args = parser.parse_args(argv)
 
     if args.live and args.paper:
@@ -787,26 +1103,36 @@ def parse_args(argv: Optional[list[str]] = None) -> Config:
     else:
         live = _env_flag_is_live()
 
-    ticker = args.ticker.strip().upper()
-    if not ticker.startswith("KRW-") or len(ticker.split("-")) != 2:
-        raise SystemExit("종목은 KRW-BTC 처럼 원화 마켓 코드여야 합니다.")
-
+    ticker = _parse_ticker(args.ticker)
+    loop_default = "1" if ticker else "2"
+    label = ticker or "KRW-ALL"
     config = Config(
         ticker=ticker,
         k=_env_decimal("UPBIT_K", "0.5"),
         take_profit=_env_decimal("UPBIT_TAKE_PROFIT", "0.03"),
         stop_loss=_env_decimal("UPBIT_STOP_LOSS", "0.02"),
         invest_ratio=_env_decimal("UPBIT_INVEST_RATIO", "0.5"),
+        max_positions=_env_int("UPBIT_MAX_POSITIONS", "10"),
         min_order_krw=_env_int("UPBIT_MIN_ORDER_KRW", "5000"),
         no_buy_minutes=_env_int("UPBIT_NO_BUY_MINUTES", "5"),
-        loop_seconds=float(_env_decimal("UPBIT_LOOP_SECONDS", "1")),
+        loop_seconds=float(_env_decimal("UPBIT_LOOP_SECONDS", loop_default)),
         paper_krw=_env_int("UPBIT_PAPER_KRW", "1000000"),
         live=live,
         once=args.once,
-        state_path=Path("state") / f"{'live' if live else 'paper'}_{ticker}.json",
+        state_path=Path("state") / f"{'live' if live else 'paper'}_{label}.json",
     )
     _validate_config(config)
     return config
+
+
+def _parse_ticker(raw: str) -> Optional[str]:
+    ticker = raw.strip().upper()
+    if ticker in {"ALL", "*"}:
+        return None
+    parts = ticker.split("-")
+    if len(parts) != 2 or parts[0] != "KRW" or not parts[1]:
+        raise SystemExit("종목은 ALL 또는 KRW-BTC 같은 원화 마켓 코드여야 합니다.")
+    return ticker
 
 
 def _validate_config(config: Config) -> None:
@@ -826,6 +1152,8 @@ def _validate_config(config: Config) -> None:
         raise SystemExit("UPBIT_NO_BUY_MINUTES 는 0 이상이어야 합니다.")
     if config.paper_krw < 0:
         raise SystemExit("UPBIT_PAPER_KRW 는 0 이상이어야 합니다.")
+    if config.max_positions < 1:
+        raise SystemExit("UPBIT_MAX_POSITIONS 는 1 이상이어야 합니다.")
 
 
 def main(argv: Optional[list[str]] = None) -> int:

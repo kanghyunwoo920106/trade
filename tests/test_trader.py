@@ -54,6 +54,7 @@ ENV_KEYS = [
     "UPBIT_LOOP_SECONDS",
     "UPBIT_NO_BUY_MINUTES",
     "UPBIT_MIN_ORDER_KRW",
+    "UPBIT_MAX_POSITIONS",
 ]
 
 
@@ -70,6 +71,7 @@ def snapshot(
     prev_high="110",
     prev_low="90",
     candle_day=None,
+    ticker="KRW-BTC",
 ):
     return Snapshot(
         now=now,
@@ -80,6 +82,7 @@ def snapshot(
         candle_day=trading_day_key(now) if candle_day is None else candle_day,
         krw_balance=Decimal(krw),
         coin_volume=Decimal(coin),
+        ticker=ticker,
     )
 
 
@@ -101,19 +104,19 @@ class StrategyTest(unittest.TestCase):
 
     def test_buy_when_price_reaches_target_with_half_balance(self):
         now = kst(2026, 10, 7, 10, 0)
-        decision = evaluate(Config(), snapshot(now, "110"), BotState(ticker="KRW-BTC"))
+        decision = evaluate(Config(ticker="KRW-BTC"), snapshot(now, "110"), BotState())
         self.assertEqual(decision.action, "buy")
         self.assertEqual(decision.order_krw, 500_000)
         self.assertEqual(decision.target_price, Decimal("110"))
 
     def test_hold_below_target(self):
         now = kst(2026, 10, 7, 10, 0)
-        decision = evaluate(Config(), snapshot(now, "109.9"), BotState(ticker="KRW-BTC"))
+        decision = evaluate(Config(), snapshot(now, "109.9"), BotState())
         self.assertEqual(decision.action, "hold")
 
     def test_no_second_buy_same_trading_day(self):
         now = kst(2026, 10, 7, 11, 0)
-        state = BotState(ticker="KRW-BTC", last_buy_day="2026-10-07")
+        state = BotState(last_buy_days={"KRW-BTC": "2026-10-07"})
         decision = evaluate(Config(), snapshot(now, "150"), state)
         self.assertEqual(decision.action, "hold")
 
@@ -123,23 +126,20 @@ class StrategyTest(unittest.TestCase):
         decision = evaluate(
             Config(),
             snapshot(now, "150", candle_day="2026-10-06"),
-            BotState(ticker="KRW-BTC"),
+            BotState(),
         )
         self.assertEqual(decision.action, "hold")
         self.assertIn("장 마감", decision.reason)
 
     def test_skip_buy_when_order_would_be_under_5000(self):
         now = kst(2026, 10, 7, 10, 0)
-        decision = evaluate(Config(), snapshot(now, "150", krw="9000"), BotState(ticker="KRW-BTC"))
+        decision = evaluate(Config(ticker="KRW-BTC"), snapshot(now, "150", krw="9000"), BotState())
         self.assertEqual(decision.action, "hold")
         self.assertIsNone(decision.order_krw)
 
     def test_take_profit_at_plus_3_percent(self):
         now = kst(2026, 10, 7, 12, 0)
-        state = BotState(
-            ticker="KRW-BTC",
-            position=Position("2026-10-07", "100000", "0.01"),
-        )
+        state = BotState(positions={"KRW-BTC": Position("2026-10-07", "100000", "0.01")})
         hold = evaluate(Config(), snapshot(now, "102999", coin="0.01"), state)
         self.assertEqual(hold.action, "hold")
         sell = evaluate(Config(), snapshot(now, "103000", coin="0.01"), state)
@@ -148,10 +148,7 @@ class StrategyTest(unittest.TestCase):
 
     def test_stop_loss_at_minus_2_percent(self):
         now = kst(2026, 10, 7, 12, 0)
-        state = BotState(
-            ticker="KRW-BTC",
-            position=Position("2026-10-07", "100000", "0.01"),
-        )
+        state = BotState(positions={"KRW-BTC": Position("2026-10-07", "100000", "0.01")})
         hold = evaluate(Config(), snapshot(now, "98001", coin="0.01"), state)
         self.assertEqual(hold.action, "hold")
         sell = evaluate(Config(), snapshot(now, "98000", coin="0.01"), state)
@@ -161,9 +158,8 @@ class StrategyTest(unittest.TestCase):
     def test_sell_entire_position_at_next_session_open(self):
         now = kst(2026, 10, 8, 9, 0)
         state = BotState(
-            ticker="KRW-BTC",
-            last_buy_day="2026-10-07",
-            position=Position("2026-10-07", "100000", "0.01"),
+            last_buy_days={"KRW-BTC": "2026-10-07"},
+            positions={"KRW-BTC": Position("2026-10-07", "100000", "0.01")},
         )
         # 가격이 그대로여도 09:00 에는 판다.
         decision = evaluate(Config(), snapshot(now, "100000", coin="0.01"), state)
@@ -173,10 +169,7 @@ class StrategyTest(unittest.TestCase):
 
     def test_time_exit_beats_a_new_buy_signal(self):
         now = kst(2026, 10, 8, 9, 0)
-        state = BotState(
-            ticker="KRW-BTC",
-            position=Position("2026-10-07", "100", "1"),
-        )
+        state = BotState(positions={"KRW-BTC": Position("2026-10-07", "100", "1")})
         decision = evaluate(Config(), snapshot(now, "200", coin="1"), state)
         self.assertEqual(decision.action, "sell")
 
@@ -185,7 +178,7 @@ class StrategyTest(unittest.TestCase):
         decision = evaluate(
             Config(),
             snapshot(now, "150", candle_day="2026-10-06"),
-            BotState(ticker="KRW-BTC"),
+            BotState(),
         )
         self.assertEqual(decision.action, "hold")
         self.assertIsNone(decision.target_price)
@@ -199,6 +192,20 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(volume_to_str(Decimal("0.000000019")), "0.00000001")
         self.assertNotIn("e", volume_to_str(Decimal("0.00000001")))
 
+    def test_all_market_order_uses_one_slot_of_the_fifty_percent(self):
+        now = kst(2026, 10, 7, 10, 0)
+        decision = evaluate(Config(max_positions=10), snapshot(now, "110"), BotState())
+        # 1,000,000 * 50% / 10종목 = 50,000
+        self.assertEqual(decision.action, "buy")
+        self.assertEqual(decision.order_krw, 50_000)
+
+    def test_full_book_blocks_a_new_breakout(self):
+        now = kst(2026, 10, 7, 10, 0)
+        state = BotState(positions={"KRW-ETH": Position("2026-10-07", "100", "1")})
+        decision = evaluate(Config(max_positions=1), snapshot(now, "150"), state)
+        self.assertEqual(decision.action, "hold")
+        self.assertIn("최대 보유", decision.reason)
+
 
 class OrderResultTest(unittest.TestCase):
     def test_success_requires_uuid_and_no_error(self):
@@ -210,18 +217,18 @@ class OrderResultTest(unittest.TestCase):
 
 class PaperExecutionTest(unittest.TestCase):
     def test_paper_buy_and_sell_update_virtual_balance(self):
-        state = BotState(ticker="KRW-BTC", paper_krw=1_000_000, paper_volume="0")
+        state = BotState(paper_krw=1_000_000)
         exchange = trader.PaperExchange(state, market=None, initial_krw=1_000_000)
         bought = exchange.buy("KRW-BTC", 500_000, Decimal("100"))
         self.assertTrue(bought.success)
         self.assertEqual(state.paper_krw, 500_000)
         expected_volume = (Decimal(500_000) * (Decimal("1") - FEE_RATE) / Decimal("100"))
         expected_volume = expected_volume.quantize(Decimal("0.00000001"))
-        self.assertEqual(Decimal(state.paper_volume), expected_volume)
+        self.assertEqual(Decimal(state.paper_volumes["KRW-BTC"]), expected_volume)
 
         sold = exchange.sell("KRW-BTC", expected_volume, Decimal("103"))
         self.assertTrue(sold.success)
-        self.assertEqual(state.paper_volume, "0")
+        self.assertNotIn("KRW-BTC", state.paper_volumes)
         gross = expected_volume * Decimal("103")
         proceeds = int((gross * (Decimal("1") - FEE_RATE)).to_integral_value(rounding=ROUND_DOWN))
         self.assertEqual(state.paper_krw, 500_000 + proceeds)
@@ -229,11 +236,11 @@ class PaperExecutionTest(unittest.TestCase):
     def test_run_once_buys_then_does_not_buy_again(self):
         now = kst(2026, 10, 7, 10, 0)
         later = kst(2026, 10, 7, 10, 5)
-        state = BotState(ticker="KRW-BTC", paper_krw=1_000_000, paper_volume="0")
+        state = BotState(paper_krw=1_000_000)
         path = Path(self.id().replace(".", "_") + ".json")
         # 테스트가 작업 디렉터리에 파일을 남기지 않게 임시 경로를 쓴다.
         path = Path(os.environ.get("TMPDIR", "/tmp")) / path.name
-        config = Config(state_path=path, once=True)
+        config = Config(state_path=path, once=True, ticker="KRW-BTC")
         snaps = [
             snapshot(now, "110"),
             snapshot(later, "111", krw="500000", coin="1"),
@@ -243,9 +250,9 @@ class PaperExecutionTest(unittest.TestCase):
             def __init__(self):
                 self.buys = []
 
-            def fetch(self, ticker, moment):
-                del ticker, moment
-                return snaps.pop(0)
+            def fetch_market(self, config, moment):
+                del config, moment
+                return [snaps.pop(0)]
 
             def buy(self, ticker, order_krw, price):
                 del ticker
@@ -265,23 +272,23 @@ class PaperExecutionTest(unittest.TestCase):
             self.assertEqual(first, "filled")
             self.assertEqual(exchange.buys, [500_000])
             self.assertEqual(second, "hold")
-            self.assertEqual(state.last_buy_day, "2026-10-07")
-            self.assertIsNotNone(state.position)
+            self.assertEqual(state.last_buy_days["KRW-BTC"], "2026-10-07")
+            self.assertIn("KRW-BTC", state.positions)
             saved = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["position"]["trading_day"], "2026-10-07")
+            self.assertEqual(saved["positions"]["KRW-BTC"]["trading_day"], "2026-10-07")
         finally:
             path.unlink(missing_ok=True)
 
     def test_failed_order_does_not_open_a_position(self):
         now = kst(2026, 10, 7, 10, 0)
-        state = BotState(ticker="KRW-BTC", paper_krw=1_000_000, paper_volume="0")
+        state = BotState(paper_krw=1_000_000)
         path = Path("/tmp/upbit_trader_fail.json")
-        config = Config(state_path=path)
+        config = Config(state_path=path, ticker="KRW-BTC")
 
         class Reject:
-            def fetch(self, ticker, moment):
-                del ticker, moment
-                return snapshot(now, "110")
+            def fetch_market(self, config, moment):
+                del config, moment
+                return [snapshot(now, "110")]
 
             def buy(self, ticker, order_krw, price):
                 del ticker, order_krw, price
@@ -291,21 +298,21 @@ class PaperExecutionTest(unittest.TestCase):
             with mock.patch("sys.stdout"):
                 outcome = run_once(config, Reject(), state, now, log_status=False)
             self.assertEqual(outcome, "rejected")
-            self.assertIsNone(state.position)
-            self.assertIsNone(state.last_buy_day)
+            self.assertEqual(state.positions, {})
+            self.assertEqual(state.last_buy_days, {})
         finally:
             path.unlink(missing_ok=True)
 
     def test_trade_log_includes_balance_and_result(self):
         now = kst(2026, 10, 7, 10, 0)
-        state = BotState(ticker="KRW-BTC", paper_krw=1_000_000, paper_volume="0")
+        state = BotState(paper_krw=1_000_000)
         path = Path("/tmp/upbit_trader_log.json")
-        config = Config(state_path=path)
+        config = Config(state_path=path, ticker="KRW-BTC")
 
         class Scripted:
-            def fetch(self, ticker, moment):
-                del ticker, moment
-                return snapshot(now, "110")
+            def fetch_market(self, config, moment):
+                del config, moment
+                return [snapshot(now, "110")]
 
             def buy(self, ticker, order_krw, price):
                 del ticker, order_krw
@@ -319,8 +326,49 @@ class PaperExecutionTest(unittest.TestCase):
             self.assertIn("잔고 조회", printed)
             self.assertIn("주문 성공", printed)
             self.assertIn("매수 시도", printed)
+            self.assertIn("KRW-BTC", printed)
         finally:
             path.unlink(missing_ok=True)
+
+    def test_scan_buys_the_stronger_breakout_when_only_one_slot_is_open(self):
+        now = kst(2026, 10, 7, 10, 0)
+        state = BotState(paper_krw=1_000_000)
+        path = Path("/tmp/upbit_trader_multi.json")
+        config = Config(state_path=path, max_positions=1, ticker=None)
+        eth = snapshot(now, "150", ticker="KRW-ETH")
+        btc = snapshot(now, "120", ticker="KRW-BTC")
+
+        class Book:
+            def __init__(self):
+                self.buys = []
+
+            def fetch_market(self, config, moment):
+                del config, moment
+                return [btc, eth]
+
+            def available_krw(self):
+                return Decimal(state.paper_krw or 0)
+
+            def buy(self, ticker, order_krw, price):
+                self.buys.append(ticker)
+                state.paper_krw = int(state.paper_krw or 0) - order_krw
+                return Fill(True, f"모의 매수 성공 | {ticker}", entry_price=price, volume=Decimal("1"))
+
+            def sell(self, ticker, volume, price):
+                del ticker, volume, price
+                raise AssertionError("매도 조건이 아닙니다")
+
+        book = Book()
+        try:
+            with mock.patch("sys.stdout"):
+                outcome = run_once(config, book, state, now, log_status=True)
+            self.assertEqual(outcome, "filled")
+            self.assertEqual(book.buys, ["KRW-ETH"])
+            self.assertIn("KRW-ETH", state.positions)
+            self.assertNotIn("KRW-BTC", state.positions)
+        finally:
+            path.unlink(missing_ok=True)
+            trader.quote_path_for(path).unlink(missing_ok=True)
 
 
 class LoopSafetyTest(unittest.TestCase):
@@ -339,7 +387,8 @@ class LoopSafetyTest(unittest.TestCase):
     def test_parse_defaults_match_requested_strategy(self):
         config = parse_args([])
         self.assertFalse(config.live)
-        self.assertEqual(config.ticker, "KRW-BTC")
+        self.assertIsNone(config.ticker)
+        self.assertEqual(config.max_positions, 10)
         self.assertEqual(config.k, Decimal("0.5"))
         self.assertEqual(config.take_profit, Decimal("0.03"))
         self.assertEqual(config.stop_loss, Decimal("0.02"))
@@ -357,7 +406,7 @@ class LoopSafetyTest(unittest.TestCase):
             self.skipTest("이 환경에는 이미 업비트 키가 있다")
         config = Config(live=True, state_path=Path("/tmp/ignored.json"))
         with self.assertRaises(SystemExit):
-            trader.build_exchange(config, BotState(ticker="KRW-BTC"))
+            trader.build_exchange(config, BotState())
 
     def test_invalid_ticker_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -368,8 +417,8 @@ class LoopSafetyTest(unittest.TestCase):
         config = Config(state_path=path, once=True, live=False)
 
         class Boom:
-            def fetch(self, ticker, moment):
-                del ticker, moment
+            def fetch_market(self, config, moment):
+                del config, moment
                 raise RuntimeError("network down")
 
         try:
@@ -404,22 +453,47 @@ class LoopSafetyTest(unittest.TestCase):
         self.assertEqual(price, Decimal("105.0"))
         self.assertEqual(pauses, [REQUEST_INTERVAL_SEC, REQUEST_INTERVAL_SEC])
 
+    def test_load_levels_skips_a_market_without_candles(self):
+        index = [pd.Timestamp("2026-10-06 09:00:00"), pd.Timestamp("2026-10-07 09:00:00")]
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 105.0],
+                "high": [120.0, 106.0],
+                "low": [80.0, 104.0],
+                "close": [110.0, 105.0],
+                "volume": [1.0, 1.0],
+                "value": [1.0, 1.0],
+            },
+            index=index,
+        )
+
+        def fake_ohlcv(ticker="KRW-BTC", interval="day", count=2, to=None, period=0.1):
+            del interval, count, to, period
+            if ticker == "KRW-BAD":
+                return None
+            return frame
+
+        market = MarketData(sleep=lambda _seconds: None)
+        with mock.patch("trader.pyupbit.get_ohlcv", side_effect=fake_ohlcv):
+            levels = market.load_levels(["KRW-BTC", "KRW-ETH", "KRW-BAD"])
+        self.assertEqual(set(levels), {"KRW-BTC", "KRW-ETH"})
+        self.assertEqual(levels["KRW-ETH"].today_open, Decimal("105"))
+        self.assertEqual(levels["KRW-ETH"].candle_day, "2026-10-07")
+
     def test_state_round_trip(self):
         path = Path("/tmp/upbit_trader_state.json")
         state = BotState(
-            ticker="KRW-BTC",
-            last_buy_day="2026-10-07",
+            last_buy_days={"KRW-BTC": "2026-10-07"},
             paper_krw=500000,
-            paper_volume="0.01000000",
-            position=Position("2026-10-07", "100", "0.01000000"),
+            paper_volumes={"KRW-BTC": "0.01000000"},
+            positions={"KRW-BTC": Position("2026-10-07", "100", "0.01000000")},
         )
         try:
             save_state(path, state)
-            loaded = load_state(path, "KRW-BTC", 1)
-            self.assertEqual(loaded.position.entry_price, "100")
+            loaded = load_state(path, 1)
+            self.assertEqual(loaded.positions["KRW-BTC"].entry_price, "100")
             self.assertEqual(loaded.paper_krw, 500000)
-            other = load_state(path, "KRW-ETH", 1)
-            self.assertIsNone(other.position)
+            self.assertEqual(loaded.paper_volumes["KRW-BTC"], "0.01000000")
         finally:
             path.unlink(missing_ok=True)
 
