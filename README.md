@@ -39,7 +39,7 @@ export UPBIT_ACCESS_KEY="발급받은 액세스 키"
 export UPBIT_SECRET_KEY="발급받은 시크릿 키"
 ```
 
-업비트 Open API 키는 **자산 조회와 주문**만 허용하고, 출금 권한은 끄세요. 예시 값은 `.env.example` 에 있습니다.
+업비트 Open API 키는 **자산 조회와 주문**만 허용하고, 출금 권한은 끄세요. 키를 만들 때 등록한 IP가 아니면 업비트가 잔고 조회를 거절하고 카카오톡으로 "Open API 미등록 IP 접근" 안내를 보냅니다. Open API 관리에서 그 안내에 적힌 IP를 허용 목록에 추가한 뒤 `--live` 를 다시 실행하세요. 예시 값은 `.env.example` 에 있습니다.
 
 ## 실행
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -259,6 +260,19 @@ def order_budget_ratio(config: Config) -> Decimal:
     return config.invest_ratio / Decimal(position_slots(config))
 
 
+def planned_order_krw(krw_balance: Decimal, config: Config) -> Optional[int]:
+    """종목당 주문 금액.
+
+    전체 마켓은 투자 비율을 슬롯 수로 나눈다. 5만 원처럼 잔고가 작아
+    그 금액이 업비트 최소 주문 5,000원보다 작으면, 투자 비율 한도 안에서
+    최소 주문 금액 이상으로 한 건을 낸다.
+    """
+    split = calc_order_krw(krw_balance, order_budget_ratio(config), config.min_order_krw)
+    if split is not None:
+        return split
+    return calc_order_krw(krw_balance, config.invest_ratio, config.min_order_krw)
+
+
 def evaluate(config: Config, snap: Snapshot, state: BotState) -> Decision:
     """한 종목을 두고 지금 살지, 팔지, 기다릴지 정한다."""
     day = trading_day_key(snap.now)
@@ -306,7 +320,7 @@ def evaluate(config: Config, snap: Snapshot, state: BotState) -> Decision:
     if config.ticker is None and state.open_position_count() >= config.max_positions:
         return Decision("hold", "최대 보유 종목 수에 도달해서 신규 매수하지 않습니다", target)
 
-    order_krw = calc_order_krw(snap.krw_balance, order_budget_ratio(config), config.min_order_krw)
+    order_krw = planned_order_krw(snap.krw_balance, config)
     if order_krw is None:
         return Decision(
             "hold",
@@ -405,7 +419,35 @@ def quote_path_for(state_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 class MarketDataError(RuntimeError):
-    """시세 조회 실패. 루프는 이 오류로 종료하지 않는다."""
+    """시세 조회 실패. 일시적인 오류는 루프를 끝내지 않는다."""
+
+
+class IpNotAllowed(MarketDataError):
+    """허용 IP가 아니면 재조회할 때마다 업비트가 알림을 보낸다."""
+
+
+def explain_balance_response(rows: object) -> None:
+    """잔고 응답이 계좌 목록이 아니면 이유를 담아 예외를 낸다."""
+    if isinstance(rows, list):
+        return
+    name = ""
+    message = ""
+    if isinstance(rows, dict):
+        error = rows.get("error")
+        if isinstance(error, dict):
+            name = str(error.get("name") or "")
+            message = str(error.get("message") or "")
+    if name == "no_authorization_ip":
+        found = re.search(r"(\d+\.\d+\.\d+\.\d+)", message)
+        ip_text = found.group(1) if found else "카카오톡 안내에 적힌 IP"
+        raise IpNotAllowed(
+            "업비트 Open API 허용 IP에 이 컴퓨터가 없습니다. "
+            f"요청 IP: {ip_text}. "
+            "업비트 Open API 관리에서 이 IP를 등록한 뒤 다시 실행하세요. "
+            "등록 전에는 잔고를 다시 조회하지 않습니다."
+        )
+    detail = f"{name} {message}".strip() or f"응답 형식 {type(rows).__name__}"
+    raise MarketDataError(f"잔고 조회에 실패했습니다. {detail}")
 
 
 class MarketData:
@@ -711,8 +753,7 @@ class LiveExchange:
         """전체 잔고를 한 번만 조회한다. 종목마다 잔고 API 를 치지 않는다."""
         rows = self.upbit.get_balances()
         self._sleep(REQUEST_INTERVAL_SEC)
-        if not isinstance(rows, list):
-            raise MarketDataError("잔고 조회에 실패했습니다.")
+        explain_balance_response(rows)
         krw = Decimal("0")
         coins: dict[str, Decimal] = {}
         for row in rows:
@@ -1031,6 +1072,10 @@ def run(
             log("사용자 중단으로 종료합니다.", now)
             save_state(config.state_path, state)
             return 0
+        except IpNotAllowed as exc:
+            # 같은 오류로 다시 치면 업비트가 미등록 IP 알림을 계속 보낸다.
+            log(str(exc), now)
+            return 2
         except Exception as exc:
             # 네트워크, 응답 형식, 일시적 시세 오류가 나도 프로세스를 유지한다.
             failures += 1

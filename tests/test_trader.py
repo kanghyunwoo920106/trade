@@ -192,6 +192,26 @@ class StrategyTest(unittest.TestCase):
         self.assertEqual(volume_to_str(Decimal("0.000000019")), "0.00000001")
         self.assertNotIn("e", volume_to_str(Decimal("0.00000001")))
 
+    def test_fifty_thousand_won_still_meets_the_minimum_order(self):
+        now = kst(2026, 10, 7, 10, 0)
+        decision = evaluate(Config(max_positions=10), snapshot(now, "110", krw="50000"), BotState())
+        # 5만 원의 5%는 2,500원으로 최소 주문보다 작다. 50% 한도인 2만 5천 원으로 한 건을 낸다.
+        self.assertEqual(decision.action, "buy")
+        self.assertEqual(decision.order_krw, 25_000)
+
+    def test_unregistered_ip_stops_without_retry_text(self):
+        with self.assertRaises(trader.IpNotAllowed) as caught:
+            trader.explain_balance_response(
+                {
+                    "error": {
+                        "name": "no_authorization_ip",
+                        "message": "The request was made from an unregistered IP address. Request IP: 203.0.113.8",
+                    }
+                }
+            )
+        self.assertIn("203.0.113.8", str(caught.exception))
+        self.assertIn("다시 조회하지 않습니다", str(caught.exception))
+
     def test_all_market_order_uses_one_slot_of_the_fifty_percent(self):
         now = kst(2026, 10, 7, 10, 0)
         decision = evaluate(Config(max_positions=10), snapshot(now, "110"), BotState())
